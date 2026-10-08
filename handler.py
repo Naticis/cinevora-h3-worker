@@ -101,6 +101,18 @@ def default_sglang_args(gpus):
     return "--performance-mode memory --layerwise-offload-components dit,text_encoder,vae"
 
 
+def download_weights(root, patterns):
+    """Download matching files of the H3 repo into root (resumes partial files).
+
+    Uses the Python API rather than the `hf` command: the command's --include
+    option changed between huggingface_hub versions (one pattern per flag in
+    1.x), which made it treat "FL2VA/*" as a file name.
+    """
+    from huggingface_hub import snapshot_download
+    snapshot_download(repo_id=HF_REPO, local_dir=str(root), allow_patterns=list(patterns),
+                      max_workers=int(os.getenv("H3_DOWNLOAD_WORKERS", "16")))
+
+
 def _weights_marker():
     return Path(MODEL_PATH) / f".download-complete-{VARIANT_DIRS[VARIANT]}"
 
@@ -128,12 +140,10 @@ def ensure_weights():
         f"({'resuming' if have else 'one time, ~144 GB'})...")
     root.mkdir(parents=True, exist_ok=True)
     started = time.time()
-    result = subprocess.run(
-        ["hf", "download", HF_REPO, "--include", "model_index.json", f"{VARIANT_DIRS[VARIANT]}/*",
-         "--local-dir", str(root)],
-    )
-    if result.returncode != 0:
-        raise JobError(f"Weight download failed (exit {result.returncode}); the next start resumes it.")
+    try:
+        download_weights(root, ["model_index.json", f"{VARIANT_DIRS[VARIANT]}/*"])
+    except Exception as exc:
+        raise JobError(f"Weight download failed ({type(exc).__name__}: {exc}); the next start resumes it.")
     _weights_marker().write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
     log(f"download complete in {time.time() - started:.0f}s")
 
