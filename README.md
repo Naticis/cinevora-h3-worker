@@ -40,6 +40,21 @@ Each variant folder in the repo is a complete checkpoint of about **144 GB**:
 A volume can be enlarged later but never shrunk, so starting with 200 GB and growing it
 when you add Ref2VA is fine.
 
+**Option A — let the serverless worker download them (no pod).** Attach the volume to the
+endpoint, add the environment variable `H3_AUTO_DOWNLOAD=1`, set Max workers to 1, and send
+one warmup request from the endpoint's Requests tab:
+
+```json
+{"input": {"warmup": true}}
+```
+
+The worker downloads FL2VA (~144 GB) to the volume, loads the model and answers
+`{"ok": true, "warmup": true, ...}`. The download runs on the GPU worker, so it is billed
+at GPU rates for those minutes; if it is interrupted, the next start resumes it. Later
+starts find the finished download and skip straight to loading.
+
+**Option B — download from a cheap CPU pod** (slower to set up, cheaper per minute):
+
 1. RunPod → Storage → New Network Volume. Pick a data center that offers the GPU you
    want for serverless (B200 or H200) — serverless workers can only use volumes in
    their own data center.
@@ -120,7 +135,7 @@ after an idle period waits for that; later jobs on the same worker do not.
 |---|---|---|
 | `H3_VARIANT` | `fl2va` | `fl2va` or `ref2va` |
 | `H3_MODEL_PATH` | `/runpod-volume/MiniMax-H3` | Where the weights are |
-| `H3_AUTO_DOWNLOAD` | `0` | `1` downloads missing weights on first start (slow; prefer step 1) |
+| `H3_AUTO_DOWNLOAD` | `0` | `1`: the worker downloads missing weights itself (resumable) |
 | `SGLANG_ARGS` | auto | Extra `sglang serve` arguments |
 | `SGLANG_STARTUP_TIMEOUT` | `2400` | Seconds to wait for the model to load |
 | `H3_JOB_TIMEOUT` | `1800` | Seconds one generation may take |
