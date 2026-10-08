@@ -101,22 +101,41 @@ def default_sglang_args(gpus):
     return "--performance-mode memory --layerwise-offload-components dit,text_encoder,vae"
 
 
+def _weights_marker():
+    return Path(MODEL_PATH) / f".download-complete-{VARIANT_DIRS[VARIANT]}"
+
+
 def ensure_weights():
+    """Make sure this variant's checkpoint is on the volume.
+
+    With H3_AUTO_DOWNLOAD=1 the worker downloads it itself (one time, ~144 GB).
+    A marker file is written only after a download finishes, so an interrupted
+    download is resumed by the next worker instead of being mistaken for a
+    complete one. Without auto-download, a manually downloaded folder is used.
+    """
     root = Path(MODEL_PATH)
-    if (root / "model_index.json").exists() and (root / VARIANT_DIRS[VARIANT]).exists():
-        return
+    have = (root / "model_index.json").exists() and (root / VARIANT_DIRS[VARIANT]).exists()
     if not AUTO_DOWNLOAD:
-        raise RuntimeError(
+        if have:
+            return
+        raise JobError(
             f"H3 weights not found at {root} (need model_index.json and {VARIANT_DIRS[VARIANT]}/). "
             "Download them to the network volume first, or set H3_AUTO_DOWNLOAD=1."
         )
-    log(f"downloading {HF_REPO} {VARIANT_DIRS[VARIANT]} to {root} (one time)...")
+    if have and _weights_marker().exists():
+        return
+    log(f"downloading {HF_REPO} {VARIANT_DIRS[VARIANT]} to {root} "
+        f"({'resuming' if have else 'one time, ~144 GB'})...")
     root.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
+    started = time.time()
+    result = subprocess.run(
         ["hf", "download", HF_REPO, "--include", "model_index.json", f"{VARIANT_DIRS[VARIANT]}/*",
          "--local-dir", str(root)],
-        check=True,
     )
+    if result.returncode != 0:
+        raise JobError(f"Weight download failed (exit {result.returncode}); the next start resumes it.")
+    _weights_marker().write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
+    log(f"download complete in {time.time() - started:.0f}s")
 
 
 def start_server():
@@ -360,6 +379,12 @@ def handler(job):
     job_input = job.get("input") if isinstance(job, dict) else None
     folder = None
     try:
+        if isinstance(job_input, dict) and job_input.get("warmup"):
+            # {"input": {"warmup": true}}: download the weights if needed and load
+            # the model, without generating. Handy right after deployment.
+            start_server()
+            return {"ok": True, "warmup": True, "variant": VARIANT, "model": _served_model,
+                    "seconds": round(time.time() - started, 1)}
         start_server()
         spec = validate(job_input)
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -407,5 +432,12 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, _shutdown)
     if os.getenv("H3_START_ON_BOOT", "1") == "1":
-        start_server()  # load the model before taking the first job
+        # Load the model before taking the first job. If that fails (weights not
+        # downloaded yet, wrong variant), keep the worker up instead of crashing:
+        # a crash makes RunPod restart it in a loop and bill GPU time each time.
+        # Jobs then retry the start and report the reason.
+        try:
+            start_server()
+        except Exception as exc:
+            log(f"model not loaded at boot: {exc}")
     runpod.serverless.start({"handler": handler})
