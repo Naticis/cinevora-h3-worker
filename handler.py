@@ -58,6 +58,7 @@ _server = None
 _served_model = None
 _start_lock = threading.Lock()   # one download/model start at a time
 _boot_thread = None              # background preparation started at boot
+_downloading = False             # a weight download is in progress on this worker
 
 
 def log(msg):
@@ -111,9 +112,70 @@ def download_weights(root, patterns):
     option changed between huggingface_hub versions (one pattern per flag in
     1.x), which made it treat "FL2VA/*" as a file name.
     """
+    global _downloading
     from huggingface_hub import snapshot_download
-    snapshot_download(repo_id=HF_REPO, local_dir=str(root), allow_patterns=list(patterns),
-                      max_workers=int(os.getenv("H3_DOWNLOAD_WORKERS", "16")))
+    _downloading = True
+    try:
+        snapshot_download(repo_id=HF_REPO, local_dir=str(root), allow_patterns=list(patterns),
+                          max_workers=int(os.getenv("H3_DOWNLOAD_WORKERS", "16")))
+    finally:
+        _downloading = False
+
+
+def _tree_size(path):
+    total = 0
+    for dirpath, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _partial_files(root):
+    """Leftovers of interrupted downloads: *.incomplete files and stale locks."""
+    found = []
+    cache = Path(root) / ".cache" / "huggingface"
+    for dirpath, _, files in os.walk(cache):
+        for name in files:
+            if name.endswith(".incomplete") or name.endswith(".lock"):
+                found.append(Path(dirpath) / name)
+    return found
+
+
+def disk_job(job_input):
+    """{"disk": true[, "clean_partial": true]}: report volume usage, optionally
+    delete the leftovers of interrupted downloads. Runs without loading the model."""
+    root = Path(MODEL_PATH)
+    gb = lambda n: round(n / 1024 ** 3, 1)
+    removed = 0
+    if job_input.get("clean_partial"):
+        if _downloading:
+            return {"ok": False, "error": "A download is running on this worker; try again when it stops."}
+        for f in _partial_files(root):
+            try:
+                size = f.stat().st_size
+                f.unlink()
+                removed += size
+            except OSError:
+                pass
+        log(f"removed {gb(removed)} GB of partial download files")
+    usage = shutil.disk_usage(str(root if root.exists() else root.parent))
+    folders = {}
+    if root.exists():
+        for entry in sorted(root.iterdir()):
+            folders[entry.name] = gb(_tree_size(entry) if entry.is_dir() else entry.stat().st_size)
+    partial = _partial_files(root) if root.exists() else []
+    return {
+        "ok": True, "disk": True, "variant": VARIANT,
+        "volume_total_gb": gb(usage.total), "volume_used_gb": gb(usage.used), "volume_free_gb": gb(usage.free),
+        "folders_gb": folders,
+        "partial_files": len(partial),
+        "partial_gb": gb(sum(f.stat().st_size for f in partial if f.exists())),
+        "removed_gb": gb(removed),
+        "complete": sorted(p.name.replace(".download-complete-", "") for p in root.glob(".download-complete-*")) if root.exists() else [],
+    }
 
 
 def _weights_marker():
@@ -397,6 +459,8 @@ def handler(job):
     job_input = job.get("input") if isinstance(job, dict) else None
     folder = None
     try:
+        if isinstance(job_input, dict) and job_input.get("disk"):
+            return disk_job(job_input)  # maintenance: does not wait for the model
         if _boot_thread is not None and _boot_thread.is_alive():
             log("waiting for the model download/load started at boot...")
             _boot_thread.join()
