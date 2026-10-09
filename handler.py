@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -55,6 +56,8 @@ REF_LIMITS = {"images": 9, "videos": 3, "audio": 3, "total": 12}
 
 _server = None
 _served_model = None
+_start_lock = threading.Lock()   # one download/model start at a time
+_boot_thread = None              # background preparation started at boot
 
 
 def log(msg):
@@ -149,7 +152,12 @@ def ensure_weights():
 
 
 def start_server():
-    """Start SGLang once per worker and wait until it answers."""
+    """Start SGLang once per worker and wait until it answers (thread-safe)."""
+    with _start_lock:
+        _start_server_locked()
+
+
+def _start_server_locked():
     global _server, _served_model
     if _server is not None and _server.poll() is None:
         return
@@ -389,6 +397,9 @@ def handler(job):
     job_input = job.get("input") if isinstance(job, dict) else None
     folder = None
     try:
+        if _boot_thread is not None and _boot_thread.is_alive():
+            log("waiting for the model download/load started at boot...")
+            _boot_thread.join()
         if isinstance(job_input, dict) and job_input.get("warmup"):
             # {"input": {"warmup": true}}: download the weights if needed and load
             # the model, without generating. Handy right after deployment.
@@ -431,6 +442,13 @@ def handler(job):
             shutil.rmtree(folder, ignore_errors=True)
 
 
+def _boot_prepare():
+    try:
+        start_server()
+    except Exception as exc:
+        log(f"model not loaded at boot: {exc}")
+
+
 def _shutdown(*_):
     if _server is not None and _server.poll() is None:
         _server.send_signal(signal.SIGTERM)
@@ -442,12 +460,10 @@ if __name__ == "__main__":
 
     signal.signal(signal.SIGTERM, _shutdown)
     if os.getenv("H3_START_ON_BOOT", "1") == "1":
-        # Load the model before taking the first job. If that fails (weights not
-        # downloaded yet, wrong variant), keep the worker up instead of crashing:
-        # a crash makes RunPod restart it in a loop and bill GPU time each time.
-        # Jobs then retry the start and report the reason.
-        try:
-            start_server()
-        except Exception as exc:
-            log(f"model not loaded at boot: {exc}")
+        # Download (if needed) and load the model in the background, so the
+        # worker reports ready to RunPod at once. A worker that spends tens of
+        # minutes downloading before it reports ready gets stopped and replaced.
+        # Jobs wait for this to finish; if it fails they retry and report why.
+        _boot_thread = threading.Thread(target=_boot_prepare, name="h3-boot", daemon=True)
+        _boot_thread.start()
     runpod.serverless.start({"handler": handler})
