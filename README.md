@@ -45,8 +45,12 @@ endpoint, add the environment variable `H3_AUTO_DOWNLOAD=1`, set Max workers to 
 one warmup request from the endpoint's Requests tab:
 
 ```json
-{"input": {"warmup": true}}
+{"input": {"warmup": true}, "policy": {"executionTimeout": 7200000}}
 ```
+
+(`policy.executionTimeout` gives this one request 2 hours instead of the endpoint's
+30 minutes, because it waits for the whole download. The worker reports ready to RunPod
+at once and downloads in the background, so a slow download is not cut off.)
 
 The worker downloads FL2VA (~144 GB) to the volume, loads the model and answers
 `{"ok": true, "warmup": true, ...}`. The download runs on the GPU worker, so it is billed
@@ -62,13 +66,13 @@ starts find the finished download and skip straight to loading.
    its web terminal and run:
 
    ```bash
-   pip install -U "huggingface_hub[cli]" hf_transfer
-   export HF_HUB_ENABLE_HF_TRANSFER=1
-   hf download MiniMaxAI/MiniMax-H3 --local-dir /workspace/MiniMax-H3 \
-       --include "model_index.json" "FL2VA/*"
-   # later, for characters/references:
-   # hf download MiniMaxAI/MiniMax-H3 --local-dir /workspace/MiniMax-H3 --include "Ref2VA/*"
+   pip install -U huggingface_hub
+   python -c "from huggingface_hub import snapshot_download as d; d('MiniMaxAI/MiniMax-H3', local_dir='/workspace/MiniMax-H3', allow_patterns=['model_index.json', 'FL2VA/*'], max_workers=16)"
+   # later, for characters/references: same command with allow_patterns=['Ref2VA/*']
    du -sh /workspace/MiniMax-H3/*      # FL2VA should be ~144G
+
+   (The `hf download` command changed in huggingface_hub 1.x: `--include` takes one pattern
+   per flag. The Python call above works on every version.)
    ```
 
    If the download stops, run the same command again; it resumes. Terminate the pod
